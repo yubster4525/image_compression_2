@@ -148,14 +148,21 @@ class VGGBlock(nn.Module):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.norm1 = nn.InstanceNorm2d(out_channels, affine=True)
-        self.norm2 = nn.InstanceNorm2d(out_channels, affine=True)
+        
+        # Use layer normalization for small feature maps, instance norm otherwise
+        self.norm1 = nn.GroupNorm(num_groups=min(32, out_channels), num_channels=out_channels)
+        self.norm2 = nn.GroupNorm(num_groups=min(32, out_channels), num_channels=out_channels)
+        
         self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
         
     def forward(self, x):
         x = F.leaky_relu(self.norm1(self.conv1(x)), 0.2)
         x = F.leaky_relu(self.norm2(self.conv2(x)), 0.2)
-        x = self.pool(x)
+        
+        # Only apply pooling if feature map is big enough (at least 2x2)
+        if x.shape[2] > 1 and x.shape[3] > 1:
+            x = self.pool(x)
+        
         return x
 
 
@@ -408,6 +415,9 @@ def train_hvae_encoder(
         num_ws=G.num_ws,
         block_split=(5, 12),
         use_fp16=fp16,
+        # Use reduced channel capacity for MPS training
+        channel_base=8192 if device.type == 'mps' else 32768,
+        channel_max=256 if device.type == 'mps' else 512,
     ).to(device)
     print(f"Created HVAE encoder with max resolution {max_resolution}x{max_resolution}")
     
@@ -437,7 +447,7 @@ def train_hvae_encoder(
         print(f"Resuming from epoch {start_epoch}")
     
     # Create synthetic training data
-    num_train_samples = 50  # Number of synthetic images for training
+    num_train_samples = kwargs.get('train_samples', 50)  # Number of synthetic images for training
     print(f"Generating {num_train_samples} training samples...")
     
     # Generate random latents
@@ -706,6 +716,8 @@ if __name__ == "__main__":
                         help="Override device selection")
     parser.add_argument("--save_every", type=int, default=10,
                         help="Save checkpoints every N epochs")
+    parser.add_argument("--train_samples", type=int, default=50,
+                        help="Number of training samples to generate from StyleGAN3")
     
     args = parser.parse_args()
     
@@ -724,6 +736,7 @@ if __name__ == "__main__":
         resume_from=args.resume,
         device_override=args.device,
         save_every=args.save_every,
+        train_samples=args.train_samples,
     )
     
     print("Training completed successfully!")
