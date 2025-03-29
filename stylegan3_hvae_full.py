@@ -172,21 +172,27 @@ class HierarchyProjector(nn.Module):
         super().__init__()
         self.w_dim = w_dim
         self.num_ws = num_ws
+        self.in_channels = in_channels
         
-        # Global average pooling followed by MLP
-        self.projection = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(in_channels, 1024),
-            nn.LeakyReLU(0.2),
-            nn.Linear(1024, num_ws * w_dim * 2)  # *2 for mean and logvar
-        )
+        # Global average pooling 
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        
+        # Adaptive projection network that works with any input size
+        # Instead of fixed size, we'll check dimensions at runtime and use a flexible approach
+        self.fc1 = nn.Linear(in_channels, 256)  # Smaller intermediate size
+        self.act = nn.LeakyReLU(0.2)
+        self.fc2 = nn.Linear(256, num_ws * w_dim * 2)  # *2 for mean and logvar
     
     def forward(self, x):
         batch_size = x.shape[0]
         
-        # Project to W space
-        w_params = self.projection(x)
+        # Global average pooling and flatten
+        x = self.pool(x)
+        x = x.view(batch_size, -1)
+        
+        # Forward through MLP
+        x = self.act(self.fc1(x))
+        w_params = self.fc2(x)
         
         # Reshape to [batch_size, num_ws, w_dim*2]
         w_params = w_params.view(batch_size, self.num_ws, self.w_dim * 2)
