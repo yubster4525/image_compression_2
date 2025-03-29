@@ -353,6 +353,8 @@ def train_hvae_encoder(
     use_random_latents=True,
     noise_mode='const',
     save_every=10,
+    train_samples=50,
+    **kwargs,
 ):
     """
     Train the HVAE encoder for StyleGAN3.
@@ -447,7 +449,7 @@ def train_hvae_encoder(
         print(f"Resuming from epoch {start_epoch}")
     
     # Create synthetic training data
-    num_train_samples = kwargs.get('train_samples', 50)  # Number of synthetic images for training
+    num_train_samples = train_samples  # Number of synthetic images for training
     print(f"Generating {num_train_samples} training samples...")
     
     # Generate random latents
