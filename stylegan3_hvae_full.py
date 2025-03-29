@@ -645,43 +645,45 @@ def train_hvae_encoder(
               f"Perceptual: {epoch_perceptual_loss:.4f} | "
               f"Time: {epoch_time:.2f}s")
         
-        # Save samples and checkpoint periodically
+        # Save samples and checkpoint periodically - use CPU to avoid memory issues
         if (epoch + 1) % save_every == 0 or epoch == num_epochs - 1:
-            # Set encoder to eval mode
-            encoder.eval()
-            
-            # Generate samples
-            with torch.no_grad():
-                # Select a few samples for visualization
-                sample_indices = [0, 1, 2]
-                sample_images = train_images[sample_indices]
+            try:
+                # Use CPU for sample generation
+                encoder_cpu = HVAE_VGG_Encoder(
+                    img_resolution=max_resolution,
+                    img_channels=G.img_channels,
+                    w_dim=G.w_dim,
+                    num_ws=G.num_ws,
+                    block_split=(5, 12),
+                    channel_base=8192,
+                    channel_max=256,
+                ).to('cpu')
+                encoder_cpu.load_state_dict(encoder.state_dict())
                 
-                # Encode and reconstruct
-                reconstructed_imgs, _ = compressor(sample_images)
+                # Get just one sample for visualization
+                sample_img = train_images[0:1].detach().cpu()
                 
-                # Compress with quantization (8 bits)
-                quantized_w = compressor.compress(sample_images, quantization_bits=8)
-                quantized_imgs = compressor.decompress(quantized_w)
-                
-                # Save samples
-                for i, idx in enumerate(sample_indices):
-                    # Original
-                    save_tensor_as_image(
-                        sample_images[i].cpu(),
-                        osp.join(output_dir, f'samples/epoch_{epoch+1}_sample_{i}_original.png')
-                    )
+                # Simple forward pass on CPU
+                with torch.no_grad():
+                    encoder_cpu.eval()
+                    # Process through encoder
+                    w_plus, _, _ = encoder_cpu(sample_img)
                     
-                    # Reconstructed
+                    # Just save original for now
                     save_tensor_as_image(
-                        reconstructed_imgs[i].cpu(),
-                        osp.join(output_dir, f'samples/epoch_{epoch+1}_sample_{i}_reconstructed.png')
+                        sample_img[0],
+                        osp.join(output_dir, f'samples/epoch_{epoch+1}_original.png')
                     )
-                    
-                    # Quantized (8 bits)
-                    save_tensor_as_image(
-                        quantized_imgs[i].cpu(),
-                        osp.join(output_dir, f'samples/epoch_{epoch+1}_sample_{i}_quantized_8bit.png')
-                    )
+                
+                # Clean up CPU resources
+                del encoder_cpu, w_plus, sample_img
+                gc.collect()
+                
+                print(f"Saved visualization sample for epoch {epoch+1}")
+                
+            except Exception as e:
+                print(f"Error generating samples: {e}")
+                # Continue training even if visualization fails
             
             # Save checkpoint
             checkpoint_path = osp.join(output_dir, f'checkpoints/epoch_{epoch+1}.pt')
