@@ -450,7 +450,7 @@ def train_hvae_encoder(
     print(f"  W dimensionality: {G.w_dim}")
     print(f"  Number of W vectors: {G.num_ws}")
     
-    # Create encoder
+    # Create encoder - full capacity for CUDA
     encoder = HVAE_VGG_Encoder(
         img_resolution=max_resolution,
         img_channels=G.img_channels,
@@ -458,9 +458,9 @@ def train_hvae_encoder(
         num_ws=G.num_ws,
         block_split=(5, 12),
         use_fp16=fp16,
-        # Use reduced channel capacity for MPS training
-        channel_base=8192 if device.type == 'mps' else 32768,
-        channel_max=256 if device.type == 'mps' else 512,
+        # Use full capacity for RTX 4080 Super
+        channel_base=32768,
+        channel_max=512,
     ).to(device)
     print(f"Created HVAE encoder with max resolution {max_resolution}x{max_resolution}")
     
@@ -571,57 +571,57 @@ def train_hvae_encoder(
         epoch_total_loss = 0
         num_batches = 0
         
-        # Train in batches
+        # Train in batches with proper CUDA support
         for i in range(0, num_train_samples, batch_size):
-            try:
-                # Get batch indices
-                batch_indices = indices[i:i+batch_size]
-                batch_size_actual = len(batch_indices)
-                
-                # Get batch data
-                batch_images = train_images[batch_indices].detach().clone()
-                
-                # Zero gradients
-                optimizer.zero_grad()
-                
-                # Encode and reconstruct (avoid autocast on MPS)
+            # Get batch indices
+            batch_indices = indices[i:i+batch_size]
+            batch_size_actual = len(batch_indices)
+            
+            # Get batch data
+            batch_images = train_images[batch_indices]
+            
+            # Zero gradients
+            optimizer.zero_grad()
+            
+            # Forward pass with mixed precision if enabled
+            with torch.cuda.amp.autocast() if scaler else torch.no_grad():
+                # Encode and reconstruct
                 reconstructed_imgs, w_plus = compressor(batch_images)
                 
                 # Reconstruction loss (L2)
                 rec_loss = F.mse_loss(batch_images, reconstructed_imgs)
                 
-                # Use MSE for perceptual loss to avoid LPIPS gradient issues on MPS
-                perceptual_loss = F.mse_loss(batch_images, reconstructed_imgs)
+                # Perceptual loss (LPIPS)
+                perceptual_loss = percep(batch_images, reconstructed_imgs).mean()
                 
-                # Alternative for W vector prediction
-                w_target = torch.zeros_like(w_plus).uniform_(-1, 1)
-                latent_loss = F.mse_loss(w_plus, w_target.detach())
+                # KL divergence
+                _, means, logvars = encoder(batch_images)
+                kl_loss = 0.5 * torch.mean(torch.sum(
+                    torch.pow((means - w_avg), 2) + 
+                    torch.exp(logvars) - logvars - 1,
+                    dim=[1, 2]
+                ))
                 
-                # Total loss - simpler version that's guaranteed to work
-                loss = rec_loss + 0.1 * latent_loss
-                
-                # Backward pass
+                # Total loss - full version with all components
+                loss = rec_weight * rec_loss + \
+                       perceptual_weight * perceptual_loss + \
+                       kl_weight * kl_loss
+            
+            # Backward pass with mixed precision if enabled
+            if scaler:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 loss.backward()
-                
-                # Update weights
                 optimizer.step()
-                
-                # Update metrics
-                epoch_rec_loss += rec_loss.item() * batch_size_actual
-                epoch_kl_loss += 0.0  # Skip calculating for now
-                epoch_perceptual_loss += perceptual_loss.item() * batch_size_actual
-                epoch_total_loss += loss.item() * batch_size_actual
-                num_batches += 1
-                
-                # Cleanup to help with memory issues
-                del reconstructed_imgs, w_plus, rec_loss, perceptual_loss, loss
-                if device.type == 'cuda':
-                    torch.cuda.empty_cache()
-                
-            except Exception as e:
-                print(f"Error during training: {e}")
-                # Continue with next batch
-                continue
+            
+            # Update metrics
+            epoch_rec_loss += rec_loss.item() * batch_size_actual
+            epoch_kl_loss += kl_loss.item() * batch_size_actual
+            epoch_perceptual_loss += perceptual_loss.item() * batch_size_actual
+            epoch_total_loss += loss.item() * batch_size_actual
+            num_batches += 1
         
         # Compute epoch metrics
         epoch_rec_loss /= num_train_samples
@@ -645,29 +645,45 @@ def train_hvae_encoder(
               f"Perceptual: {epoch_perceptual_loss:.4f} | "
               f"Time: {epoch_time:.2f}s")
         
-        # Save samples and checkpoint periodically - use CPU to avoid memory issues
+        # Save samples and checkpoint periodically - full quality for CUDA
         if (epoch + 1) % save_every == 0 or epoch == num_epochs - 1:
-            try:
-                # Save just the original image without using the encoder
-                # This avoids memory and state_dict loading issues
-                sample_img = train_images[0:1].detach().cpu()
+            # Set encoder to eval mode
+            encoder.eval()
+            
+            # Generate samples with full quality
+            with torch.no_grad():
+                # Select a few samples for visualization
+                sample_indices = [0, min(1, len(train_images)-1), min(2, len(train_images)-1)]
+                sample_images = train_images[sample_indices[:min(3, len(train_images))]]
                 
-                # Just save original image
-                with torch.no_grad():
+                # Encode and reconstruct
+                reconstructed_imgs, w_plus = compressor(sample_images)
+                
+                # Compress with quantization (8 bits)
+                quantized_w = compressor.compress(sample_images, quantization_bits=8)
+                quantized_imgs = compressor.decompress(quantized_w)
+                
+                # Save samples
+                for i in range(len(sample_images)):
+                    # Original
                     save_tensor_as_image(
-                        sample_img[0],
-                        osp.join(output_dir, f'samples/epoch_{epoch+1}_original.png')
+                        sample_images[i].detach().cpu(),
+                        osp.join(output_dir, f'samples/epoch_{epoch+1}_sample_{i}_original.png')
+                    )
+                    
+                    # Reconstructed
+                    save_tensor_as_image(
+                        reconstructed_imgs[i].detach().cpu(),
+                        osp.join(output_dir, f'samples/epoch_{epoch+1}_sample_{i}_reconstructed.png')
+                    )
+                    
+                    # Quantized (8 bits)
+                    save_tensor_as_image(
+                        quantized_imgs[i].detach().cpu(),
+                        osp.join(output_dir, f'samples/epoch_{epoch+1}_sample_{i}_quantized_8bit.png')
                     )
                 
-                # Clean up CPU resources
-                del sample_img
-                gc.collect()
-                
-                print(f"Saved visualization sample for epoch {epoch+1}")
-                
-            except Exception as e:
-                print(f"Error generating samples: {e}")
-                # Continue training even if visualization fails
+                print(f"Saved visualization samples for epoch {epoch+1}")
             
             # Save checkpoint
             checkpoint_path = osp.join(output_dir, f'checkpoints/epoch_{epoch+1}.pt')
