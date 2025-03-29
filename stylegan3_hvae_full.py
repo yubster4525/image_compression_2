@@ -648,35 +648,19 @@ def train_hvae_encoder(
         # Save samples and checkpoint periodically - use CPU to avoid memory issues
         if (epoch + 1) % save_every == 0 or epoch == num_epochs - 1:
             try:
-                # Use CPU for sample generation
-                encoder_cpu = HVAE_VGG_Encoder(
-                    img_resolution=max_resolution,
-                    img_channels=G.img_channels,
-                    w_dim=G.w_dim,
-                    num_ws=G.num_ws,
-                    block_split=(5, 12),
-                    channel_base=8192,
-                    channel_max=256,
-                ).to('cpu')
-                encoder_cpu.load_state_dict(encoder.state_dict())
-                
-                # Get just one sample for visualization
+                # Save just the original image without using the encoder
+                # This avoids memory and state_dict loading issues
                 sample_img = train_images[0:1].detach().cpu()
                 
-                # Simple forward pass on CPU
+                # Just save original image
                 with torch.no_grad():
-                    encoder_cpu.eval()
-                    # Process through encoder
-                    w_plus, _, _ = encoder_cpu(sample_img)
-                    
-                    # Just save original for now
                     save_tensor_as_image(
                         sample_img[0],
                         osp.join(output_dir, f'samples/epoch_{epoch+1}_original.png')
                     )
                 
                 # Clean up CPU resources
-                del encoder_cpu, w_plus, sample_img
+                del sample_img
                 gc.collect()
                 
                 print(f"Saved visualization sample for epoch {epoch+1}")
