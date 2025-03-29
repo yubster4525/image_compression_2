@@ -186,10 +186,24 @@ class HierarchyProjector(nn.Module):
     def forward(self, x):
         batch_size = x.shape[0]
         
+        # Print input shape for debugging
+        print(f"HierarchyProjector input shape: {x.shape}")
+        
         # Global average pooling and flatten
         x = self.pool(x)
         x = x.view(batch_size, -1)
         
+        # Print after pooling for debugging
+        print(f"After pooling shape: {x.shape}")
+        
+        # Make sure dimensions match by checking and adapting if needed
+        in_features = x.shape[1]
+        if in_features != self.in_channels:
+            print(f"Warning: Expected {self.in_channels} features but got {in_features}")
+            # Create new linear layer on-the-fly if dimensions don't match
+            device = x.device
+            self.fc1 = nn.Linear(in_features, 256).to(device)
+            
         # Forward through MLP
         x = self.act(self.fc1(x))
         w_params = self.fc2(x)
