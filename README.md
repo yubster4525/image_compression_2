@@ -252,22 +252,70 @@ For the complete ImageNet dataset:
 
 ### Gumbel-Softmax Discretization
 
-The `gumbel_softmax_compression.py` script provides differentiable discretization for improved training:
+The `gumbel_softmax_compression.py` script enables differentiable discretization for improved training of discrete latent spaces.
+
+#### Basic Training Command
 
 ```bash
 python gumbel_softmax_compression.py \
   --generator models/stylegan3-t-ffhq-1024x1024.pkl \
   --output ./output_gumbel \
   --resolution 256 \
+  --batch_size 4 \
+  --epochs 100
+```
+
+#### Full Configuration Options
+
+```bash
+python gumbel_softmax_compression.py \
+  --generator models/stylegan3-t-ffhq-1024x1024.pkl \
+  --output ./output_gumbel \
+  --resolution 256 \
+  --batch_size 4 \
+  --epochs 100 \
+  --n_embeddings 256 \           # Number of discrete codes (default: 256 for 8-bit)
+  --temperature 1.0 \            # Initial temperature for Gumbel-Softmax
+  --min_temperature 0.5 \        # Minimum temperature after annealing
+  --temp_anneal_rate 0.00003 \   # How fast temperature decreases
+  --kl_weight 0.01 \             # KL divergence weight
+  --perceptual_weight 0.8 \      # Perceptual loss weight
+  --gumbel_weight 1.0 \          # Weight for codebook utilization loss
+  --rec_weight 1.0 \             # Reconstruction loss weight
+  --fp16                         # Use mixed precision for NVIDIA GPUs
+```
+
+#### High-Performance Configuration for RTX 4080 Super
+
+```bash
+python gumbel_softmax_compression.py \
+  --generator models/stylegan3-t-ffhq-1024x1024.pkl \
+  --output ./output_gumbel \
+  --resolution 256 \
+  --batch_size 8 \
+  --epochs 100 \
   --n_embeddings 256 \
   --temperature 1.0 \
-  --min_temperature 0.5
+  --min_temperature 0.3 \
+  --temp_anneal_rate 0.00005 \
+  --device cuda \
+  --fp16
 ```
+
+#### How Gumbel-Softmax Training Works
+
+1. The script creates a model with Gumbel-Softmax discretization layer
+2. It generates synthetic training data from StyleGAN3
+3. During training, it gradually decreases the temperature parameter (annealing)
+4. The model learns to discretize the latent space while maintaining gradient flow
+5. Training tracks codebook utilization via perplexity metrics
+6. The final model is saved to `./output_gumbel/gumbel_hvae_final.pt`
 
 Key advantages:
 - End-to-end differentiable training through discrete bottlenecks
 - Better codebook utilization via perplexity loss
 - Improved reconstruction quality at the same bit rate
+- Temperature annealing for curriculum learning of discretization
 
 ### CABAC Entropy Coding
 
