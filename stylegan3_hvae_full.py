@@ -2,6 +2,7 @@ import os
 import sys
 import time
 import argparse
+import glob
 from tqdm import tqdm
 
 # Add StyleGAN3 repo to path
@@ -15,11 +16,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import torch.utils.data as data
+from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from PIL import Image
 import pickle
 import lpips
 import os.path as osp
+import torchvision.transforms as transforms
 
 # Full VGG-style Hierarchical VAE Encoder for StyleGAN3
 class HVAE_VGG_Encoder(nn.Module):
@@ -395,6 +399,9 @@ def train_hvae_encoder(
     noise_mode='const',
     save_every=10,
     train_samples=50,
+    dataset_path=None,
+    is_imagenet=False,
+    val_dataset_path=None,
     **kwargs,
 ):
     """
@@ -418,6 +425,9 @@ def train_hvae_encoder(
         use_random_latents: Use random latents for synthetic training data
         noise_mode: Noise mode for StyleGAN3 synthesis
         save_every: Save checkpoints every N epochs
+        dataset_path: Path to real image dataset (if provided, uses real images instead of StyleGAN3 samples)
+        is_imagenet: Whether the dataset has ImageNet folder structure
+        val_dataset_path: Path to validation dataset
     """
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
@@ -489,56 +499,128 @@ def train_hvae_encoder(
         start_epoch = checkpoint.get('epoch', 0) + 1
         print(f"Resuming from epoch {start_epoch}")
     
-    # Create synthetic training data
-    num_train_samples = train_samples  # Number of synthetic images for training
-    print(f"Generating {num_train_samples} training samples...")
-    
-    # Generate random latents
-    torch.manual_seed(42)  # For reproducibility
-    z_train = torch.randn(num_train_samples, G.z_dim).to(device)
-    
-    # Generate images with StyleGAN3
-    train_images = []
-    train_w = []
-    
-    with torch.no_grad():
-        for i in range(0, num_train_samples, batch_size):
-            z_batch = z_train[i:i+batch_size]
-            
-            # Generate images
-            if use_random_latents:
-                # Random latents through mapping network
-                w_batch = G.mapping(z_batch, None)
-                img_batch = G.synthesis(w_batch, noise_mode=noise_mode)
-            else:
-                # Direct generation
-                img_batch = G(z_batch, None, noise_mode=noise_mode)
-                w_batch = G.mapping(z_batch, None)  # Still get W for reference
-            
-            # Resize to training resolution if needed
-            if img_batch.shape[2] != training_resolution:
-                img_batch = F.interpolate(
-                    img_batch, 
-                    size=(training_resolution, training_resolution),
-                    mode='bilinear',
-                    align_corners=False
-                )
-            
-            train_images.append(img_batch.detach())
-            train_w.append(w_batch.detach())
-    
-    # Concatenate batches
-    train_images = torch.cat(train_images, dim=0)
-    train_w = torch.cat(train_w, dim=0)
-    
-    print(f"Training dataset: {train_images.shape}")
-    
-    # Save some training samples
-    for i in range(min(5, num_train_samples)):
-        save_tensor_as_image(
-            train_images[i].cpu(),
-            osp.join(output_dir, f'samples/train_sample_{i}.png')
+    # Setup data - either real dataset or synthetic from StyleGAN3
+    if dataset_path is not None:
+        print(f"Using real image dataset from {dataset_path}")
+        
+        # Create real image dataset
+        train_dataset = ImageDataset(
+            dataset_path,
+            resolution=training_resolution,
+            is_imagenet=is_imagenet
         )
+        
+        # Create data loader
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
+        
+        # If using real data, we need a slightly different training loop
+        using_real_data = True
+        num_train_samples = len(train_dataset)
+        print(f"Using {num_train_samples} real images for training")
+        
+        # Save some samples for reference
+        sample_indices = list(range(min(5, len(train_dataset))))
+        for i, idx in enumerate(sample_indices):
+            sample_img = train_dataset[idx].unsqueeze(0)  # Add batch dimension
+            save_tensor_as_image(
+                sample_img[0].cpu(),
+                osp.join(output_dir, f'samples/real_train_sample_{i}.png')
+            )
+    else:
+        print(f"Using synthetic data from StyleGAN3")
+        # Generate synthetic training data
+        num_train_samples = train_samples  # Number of synthetic images for training
+        print(f"Generating {num_train_samples} training samples...")
+        
+        # Generate random latents
+        torch.manual_seed(42)  # For reproducibility
+        z_train = torch.randn(num_train_samples, G.z_dim).to(device)
+        
+        # Generate images with StyleGAN3
+        train_images = []
+        train_w = []
+        
+        with torch.no_grad():
+            for i in range(0, num_train_samples, batch_size):
+                z_batch = z_train[i:i+batch_size]
+                
+                # Generate images
+                if use_random_latents:
+                    # Random latents through mapping network
+                    w_batch = G.mapping(z_batch, None)
+                    img_batch = G.synthesis(w_batch, noise_mode=noise_mode)
+                else:
+                    # Direct generation
+                    img_batch = G(z_batch, None, noise_mode=noise_mode)
+                    w_batch = G.mapping(z_batch, None)  # Still get W for reference
+                
+                # Resize to training resolution if needed
+                if img_batch.shape[2] != training_resolution:
+                    img_batch = F.interpolate(
+                        img_batch, 
+                        size=(training_resolution, training_resolution),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                
+                train_images.append(img_batch.detach())
+                train_w.append(w_batch.detach())
+        
+        # Concatenate batches
+        train_images = torch.cat(train_images, dim=0)
+        train_w = torch.cat(train_w, dim=0)
+        
+        print(f"Training dataset: {train_images.shape}")
+        
+        # Save some training samples
+        for i in range(min(5, num_train_samples)):
+            save_tensor_as_image(
+                train_images[i].cpu(),
+                osp.join(output_dir, f'samples/synthetic_train_sample_{i}.png')
+            )
+        
+        # Create synthetic dataset and loader
+        train_dataset = SyntheticDataset(train_images, train_w)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,  # Synthetic data is already in memory, no need for workers
+            pin_memory=False
+        )
+        
+        using_real_data = False
+    
+    # Create validation dataset if specified
+    val_loader = None
+    if val_dataset_path is not None:
+        print(f"Using validation dataset from {val_dataset_path}")
+        
+        # Create validation dataset
+        val_dataset = ImageDataset(
+            val_dataset_path,
+            resolution=training_resolution,
+            is_imagenet=is_imagenet
+        )
+        
+        # Create validation loader
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=True,
+            drop_last=False
+        )
+        
+        print(f"Using {len(val_dataset)} images for validation")
     
     # Extract W average from StyleGAN for KL divergence
     w_avg = G.mapping.w_avg.unsqueeze(0).unsqueeze(0).to(device)
@@ -561,24 +643,24 @@ def train_hvae_encoder(
         # Set encoder to training mode
         encoder.train()
         
-        # Shuffle data for this epoch
-        indices = torch.randperm(num_train_samples)
-        
         # Training metrics for this epoch
         epoch_rec_loss = 0
         epoch_kl_loss = 0
         epoch_perceptual_loss = 0
         epoch_total_loss = 0
         num_batches = 0
+        total_samples = 0
         
-        # Train in batches with proper CUDA support
-        for i in range(0, num_train_samples, batch_size):
-            # Get batch indices
-            batch_indices = indices[i:i+batch_size]
-            batch_size_actual = len(batch_indices)
+        # Train using data loader
+        for batch_idx, batch_data in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+            # Get batch of images (for real and synthetic data)
+            if using_real_data:
+                batch_images = batch_data.to(device)
+            else:
+                # For synthetic data, the loader provides both images and w vectors
+                batch_images = batch_data[0].to(device) if isinstance(batch_data, tuple) else batch_data.to(device)
             
-            # Get batch data
-            batch_images = train_images[batch_indices]
+            batch_size_actual = batch_images.shape[0]
             
             # Zero gradients
             optimizer.zero_grad()
@@ -622,12 +704,21 @@ def train_hvae_encoder(
             epoch_perceptual_loss += perceptual_loss.item() * batch_size_actual
             epoch_total_loss += loss.item() * batch_size_actual
             num_batches += 1
+            total_samples += batch_size_actual
+            
+            # Print progress occasionally for large datasets
+            if batch_idx % 100 == 0 and batch_idx > 0:
+                print(f"  Batch {batch_idx}/{len(train_loader)} | "
+                      f"Loss: {loss.item():.4f} | "
+                      f"Rec: {rec_loss.item():.4f} | "
+                      f"KL: {kl_loss.item():.4f} | "
+                      f"Perceptual: {perceptual_loss.item():.4f}")
         
         # Compute epoch metrics
-        epoch_rec_loss /= num_train_samples
-        epoch_kl_loss /= num_train_samples
-        epoch_perceptual_loss /= num_train_samples
-        epoch_total_loss /= num_train_samples
+        epoch_rec_loss /= total_samples
+        epoch_kl_loss /= total_samples
+        epoch_perceptual_loss /= total_samples
+        epoch_total_loss /= total_samples
         epoch_time = time.time() - epoch_start_time
         
         # Update history
@@ -645,6 +736,76 @@ def train_hvae_encoder(
               f"Perceptual: {epoch_perceptual_loss:.4f} | "
               f"Time: {epoch_time:.2f}s")
         
+        # Run validation if validation dataset is available
+        if val_loader is not None:
+            encoder.eval()
+            
+            val_rec_loss = 0
+            val_kl_loss = 0
+            val_perceptual_loss = 0
+            val_total_loss = 0
+            val_total_samples = 0
+            
+            print("Running validation...")
+            with torch.no_grad():
+                for batch_data in tqdm(val_loader, desc="Validation"):
+                    val_batch_images = batch_data.to(device)
+                    val_batch_size = val_batch_images.shape[0]
+                    
+                    # Encode and reconstruct
+                    reconstructed_imgs, w_plus = compressor(val_batch_images)
+                    
+                    # Reconstruction loss (L2)
+                    rec_loss = F.mse_loss(val_batch_images, reconstructed_imgs)
+                    
+                    # Perceptual loss (LPIPS)
+                    perceptual_loss = percep(val_batch_images, reconstructed_imgs).mean()
+                    
+                    # KL divergence
+                    _, means, logvars = encoder(val_batch_images)
+                    kl_loss = 0.5 * torch.mean(torch.sum(
+                        torch.pow((means - w_avg), 2) + 
+                        torch.exp(logvars) - logvars - 1,
+                        dim=[1, 2]
+                    ))
+                    
+                    # Total loss
+                    loss = rec_weight * rec_loss + \
+                           perceptual_weight * perceptual_loss + \
+                           kl_weight * kl_loss
+                    
+                    # Update metrics
+                    val_rec_loss += rec_loss.item() * val_batch_size
+                    val_kl_loss += kl_loss.item() * val_batch_size
+                    val_perceptual_loss += perceptual_loss.item() * val_batch_size
+                    val_total_loss += loss.item() * val_batch_size
+                    val_total_samples += val_batch_size
+            
+            # Compute validation metrics
+            val_rec_loss /= val_total_samples
+            val_kl_loss /= val_total_samples
+            val_perceptual_loss /= val_total_samples
+            val_total_loss /= val_total_samples
+            
+            # Print validation results
+            print(f"Validation | "
+                  f"Loss: {val_total_loss:.4f} | "
+                  f"Rec: {val_rec_loss:.4f} | "
+                  f"KL: {val_kl_loss:.4f} | "
+                  f"Perceptual: {val_perceptual_loss:.4f}")
+            
+            # Save validation metrics
+            if 'val_loss' not in history:
+                history['val_loss'] = []
+                history['val_rec_loss'] = []
+                history['val_kl_loss'] = []
+                history['val_perceptual_loss'] = []
+            
+            history['val_loss'].append(val_total_loss)
+            history['val_rec_loss'].append(val_rec_loss)
+            history['val_kl_loss'].append(val_kl_loss)
+            history['val_perceptual_loss'].append(val_perceptual_loss)
+        
         # Save samples and checkpoint periodically - full quality for CUDA
         if (epoch + 1) % save_every == 0 or epoch == num_epochs - 1:
             # Set encoder to eval mode
@@ -652,9 +813,15 @@ def train_hvae_encoder(
             
             # Generate samples with full quality
             with torch.no_grad():
-                # Select a few samples for visualization
-                sample_indices = [0, min(1, len(train_images)-1), min(2, len(train_images)-1)]
-                sample_images = train_images[sample_indices[:min(3, len(train_images))]]
+                # Get sample images for visualization (either from dataset or validation set)
+                if using_real_data:
+                    # Sample from training dataset
+                    sample_indices = list(range(min(3, len(train_dataset))))
+                    sample_images = torch.stack([train_dataset[idx] for idx in sample_indices]).to(device)
+                else:
+                    # Use synthetic samples
+                    sample_indices = [0, min(1, len(train_images)-1), min(2, len(train_images)-1)]
+                    sample_images = train_images[sample_indices[:min(3, len(train_images))]].to(device)
                 
                 # Encode and reconstruct
                 reconstructed_imgs, w_plus = compressor(sample_images)
@@ -682,6 +849,39 @@ def train_hvae_encoder(
                         quantized_imgs[i].detach().cpu(),
                         osp.join(output_dir, f'samples/epoch_{epoch+1}_sample_{i}_quantized_8bit.png')
                     )
+                
+                # If we have a validation set, also save some validation samples
+                if val_loader is not None:
+                    # Get some validation samples
+                    val_batch = next(iter(val_loader))
+                    val_samples = val_batch[:min(3, len(val_batch))].to(device)
+                    
+                    # Encode and reconstruct
+                    val_reconstructed, val_w_plus = compressor(val_samples)
+                    
+                    # Compress with quantization (8 bits)
+                    val_quantized_w = compressor.compress(val_samples, quantization_bits=8)
+                    val_quantized_imgs = compressor.decompress(val_quantized_w)
+                    
+                    # Save validation samples
+                    for i in range(len(val_samples)):
+                        # Original
+                        save_tensor_as_image(
+                            val_samples[i].detach().cpu(),
+                            osp.join(output_dir, f'samples/epoch_{epoch+1}_val_{i}_original.png')
+                        )
+                        
+                        # Reconstructed
+                        save_tensor_as_image(
+                            val_reconstructed[i].detach().cpu(),
+                            osp.join(output_dir, f'samples/epoch_{epoch+1}_val_{i}_reconstructed.png')
+                        )
+                        
+                        # Quantized (8 bits)
+                        save_tensor_as_image(
+                            val_quantized_imgs[i].detach().cpu(),
+                            osp.join(output_dir, f'samples/epoch_{epoch+1}_val_{i}_quantized_8bit.png')
+                        )
                 
                 print(f"Saved visualization samples for epoch {epoch+1}")
             
@@ -733,6 +933,93 @@ def save_tensor_as_image(tensor, filename):
     Image.fromarray(img).save(filename)
 
 
+class ImageDataset(Dataset):
+    """Dataset class for training with real images including ImageNet."""
+    def __init__(self, image_folder, resolution=256, is_imagenet=False, recursive=True, 
+                 file_extensions=('.png', '.jpg', '.jpeg')):
+        """
+        Args:
+            image_folder: Path to folder containing images
+            resolution: Resolution to resize images to
+            is_imagenet: If True, treats as ImageNet-style dataset with class folders
+            recursive: Whether to recursively search for images in subdirectories
+            file_extensions: Tuple of valid file extensions to include
+        """
+        self.image_folder = image_folder
+        self.resolution = resolution
+        self.is_imagenet = is_imagenet
+        self.file_extensions = file_extensions
+        
+        # Find all images
+        self.image_paths = []
+        
+        if is_imagenet or recursive:
+            # For ImageNet-style datasets with class folders or recursive search
+            for root, dirs, files in os.walk(image_folder):
+                for file in files:
+                    if file.lower().endswith(self.file_extensions):
+                        self.image_paths.append(os.path.join(root, file))
+        else:
+            # For flat directory structure
+            for ext in self.file_extensions:
+                self.image_paths.extend(glob.glob(os.path.join(image_folder, f'*{ext}')))
+                self.image_paths.extend(glob.glob(os.path.join(image_folder, f'*{ext.upper()}')))
+        
+        # Setup transformations
+        self.transform = transforms.Compose([
+            transforms.Resize((resolution, resolution), interpolation=transforms.InterpolationMode.LANCZOS),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))  # Scale to [-1, 1]
+        ])
+        
+        print(f"Found {len(self.image_paths)} images in {image_folder}")
+    
+    def __len__(self):
+        return len(self.image_paths)
+    
+    def __getitem__(self, idx):
+        """Load and preprocess an image."""
+        try:
+            # Load image file
+            img_path = self.image_paths[idx]
+            img = Image.open(img_path).convert('RGB')
+            
+            # Apply transformations
+            img_tensor = self.transform(img)
+            
+            return img_tensor
+        except Exception as e:
+            print(f"Error loading image {self.image_paths[idx]}: {e}")
+            # Return an empty tensor on error and get next one
+            if idx + 1 < len(self.image_paths):
+                return self.__getitem__(idx + 1)
+            else:
+                # Return an empty tensor at correct shape as last resort
+                return torch.zeros(3, self.resolution, self.resolution)
+
+
+class SyntheticDataset(Dataset):
+    """Dataset of images generated by StyleGAN3."""
+    def __init__(self, images, w_vectors=None):
+        """
+        Args:
+            images: Tensor of images [N, C, H, W]
+            w_vectors: Optional tensor of W vectors [N, num_ws, w_dim]
+        """
+        self.images = images
+        self.w_vectors = w_vectors
+    
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        """Return an image and optionally its W vector."""
+        if self.w_vectors is not None:
+            return self.images[idx], self.w_vectors[idx]
+        else:
+            return self.images[idx]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train StyleGAN3 HVAE Encoder")
     parser.add_argument("--generator", type=str, default="models/stylegan3-t-ffhq-1024x1024.pkl",
@@ -763,6 +1050,14 @@ if __name__ == "__main__":
                         help="Save checkpoints every N epochs")
     parser.add_argument("--train_samples", type=int, default=50,
                         help="Number of training samples to generate from StyleGAN3")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Path to training dataset (ImageNet, FFHQ, etc.). If provided, uses real images instead of StyleGAN3 samples")
+    parser.add_argument("--imagenet", action="store_true",
+                        help="Treat dataset as ImageNet with class subdirectories")
+    parser.add_argument("--val_dataset", type=str, default=None,
+                        help="Path to validation dataset")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Number of dataloader workers")
     
     args = parser.parse_args()
     
@@ -782,6 +1077,10 @@ if __name__ == "__main__":
         device_override=args.device,
         save_every=args.save_every,
         train_samples=args.train_samples,
+        dataset_path=args.dataset,
+        is_imagenet=args.imagenet,
+        val_dataset_path=args.val_dataset,
+        num_workers=args.workers,
     )
     
     print("Training completed successfully!")
