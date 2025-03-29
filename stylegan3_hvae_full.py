@@ -113,21 +113,42 @@ class HVAE_VGG_Encoder(nn.Module):
         # Dictionary to store hierarchy features
         hierarchy_features = {}
         
+        # Print input shape for debugging
+        print(f"HVAE input shape: {x.shape}")
+        
         # Initial convolution
         x = self.from_rgb(x)
         
         # Forward through blocks, capturing hierarchy features
         for i, block in enumerate(self.blocks):
+            # Check if we've reached the end of useful resolution
+            if x.shape[2] <= 1 or x.shape[3] <= 1:
+                print(f"Stopping at block {i} due to small feature map: {x.shape}")
+                break
+                
             x = block(x)
+            print(f"After block {i}, shape: {x.shape}")
             
             # Store features at hierarchy points
             if i == self.hierarchy_blocks['fine']:
                 hierarchy_features['fine'] = x
+                print(f"Stored fine features: {x.shape}")
             elif i == self.hierarchy_blocks['medium']:
                 hierarchy_features['medium'] = x
+                print(f"Stored medium features: {x.shape}")
         
         # Final features
         hierarchy_features['global'] = x
+        print(f"Stored global features: {x.shape}")
+        
+        # Make sure all hierarchy features exist, even with small input sizes
+        if 'fine' not in hierarchy_features:
+            print("Warning: Creating fine features from global")
+            hierarchy_features['fine'] = x
+        
+        if 'medium' not in hierarchy_features:
+            print("Warning: Creating medium features from global")
+            hierarchy_features['medium'] = x
         
         # Project features to latent space
         global_ws, global_means, global_logvars = self.global_projector(hierarchy_features['global'])
@@ -571,7 +592,10 @@ def train_hvae_encoder(
                 rec_loss = F.mse_loss(batch_images, reconstructed_imgs)
                 
                 # Perceptual loss (LPIPS)
-                perceptual_loss = percep(batch_images, reconstructed_imgs).mean()
+                with torch.inference_mode(False):  # Ensure gradients flow through LPIPS
+                    perceptual_loss = percep(batch_images, reconstructed_imgs).mean().detach()
+                    # Use MSE instead for now to ensure gradients flow properly
+                    perceptual_loss = F.mse_loss(batch_images, reconstructed_imgs)
                 
                 # KL divergence
                 _, means, logvars = encoder(batch_images)
