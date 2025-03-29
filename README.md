@@ -252,18 +252,42 @@ For the complete ImageNet dataset:
 
 ### Gumbel-Softmax Discretization
 
-The `gumbel_softmax_compression.py` script enables differentiable discretization for improved training of discrete latent spaces.
+The Gumbel-Softmax approach improves compression by adding differentiable discretization between the HVAE encoder and StyleGAN3 decoder. This is a two-stage training process:
 
-#### Basic Training Command
+#### Step 1: Train the Basic HVAE Encoder First
+
+Train the basic HVAE encoder with StyleGAN3 as described earlier:
 
 ```bash
+# First train the basic HVAE encoder
+python stylegan3_hvae_full.py \
+  --generator models/stylegan3-t-ffhq-1024x1024.pkl \
+  --output ./hvae_output \
+  --resolution 256 \
+  --batch_size 4 \
+  --epochs 50 \
+  --kl_weight 0.01 \
+  --perceptual_weight 0.8
+```
+
+This produces a trained encoder in `./hvae_output/hvae_encoder_final.pt`.
+
+#### Step 2: Introduce Gumbel-Softmax and Train End-to-End
+
+Now use the pre-trained encoder as a starting point, and introduce the Gumbel-Softmax discretization layer between the encoder and decoder:
+
+```bash
+# Then train with Gumbel-Softmax between HVAE and StyleGAN3
 python gumbel_softmax_compression.py \
   --generator models/stylegan3-t-ffhq-1024x1024.pkl \
   --output ./output_gumbel \
   --resolution 256 \
   --batch_size 4 \
-  --epochs 100
+  --epochs 50 \
+  --resume ./hvae_output/hvae_encoder_final.pt
 ```
+
+This loads the pre-trained encoder and adds the Gumbel-Softmax layer for end-to-end training of the discretization process.
 
 #### Full Configuration Options
 
@@ -273,16 +297,17 @@ python gumbel_softmax_compression.py \
   --output ./output_gumbel \
   --resolution 256 \
   --batch_size 4 \
-  --epochs 100 \
-  --n_embeddings 256 \           # Number of discrete codes (default: 256 for 8-bit)
-  --temperature 1.0 \            # Initial temperature for Gumbel-Softmax
-  --min_temperature 0.5 \        # Minimum temperature after annealing
-  --temp_anneal_rate 0.00003 \   # How fast temperature decreases
-  --kl_weight 0.01 \             # KL divergence weight
-  --perceptual_weight 0.8 \      # Perceptual loss weight
-  --gumbel_weight 1.0 \          # Weight for codebook utilization loss
-  --rec_weight 1.0 \             # Reconstruction loss weight
-  --fp16                         # Use mixed precision for NVIDIA GPUs
+  --epochs 50 \
+  --resume ./hvae_output/hvae_encoder_final.pt \  # Pre-trained encoder
+  --n_embeddings 256 \                # Number of discrete codes (default: 256 for 8-bit)
+  --temperature 1.0 \                 # Initial temperature for Gumbel-Softmax
+  --min_temperature 0.5 \             # Minimum temperature after annealing
+  --temp_anneal_rate 0.00003 \        # How fast temperature decreases
+  --kl_weight 0.01 \                  # KL divergence weight
+  --perceptual_weight 0.8 \           # Perceptual loss weight
+  --gumbel_weight 1.0 \               # Weight for codebook utilization loss
+  --rec_weight 1.0 \                  # Reconstruction loss weight
+  --fp16                              # Use mixed precision for NVIDIA GPUs
 ```
 
 #### High-Performance Configuration for RTX 4080 Super
@@ -293,7 +318,8 @@ python gumbel_softmax_compression.py \
   --output ./output_gumbel \
   --resolution 256 \
   --batch_size 8 \
-  --epochs 100 \
+  --epochs 50 \
+  --resume ./hvae_output/hvae_encoder_final.pt \
   --n_embeddings 256 \
   --temperature 1.0 \
   --min_temperature 0.3 \
@@ -302,16 +328,18 @@ python gumbel_softmax_compression.py \
   --fp16
 ```
 
-#### How Gumbel-Softmax Training Works
+#### How the Two-Stage Training Works
 
-1. The script creates a model with Gumbel-Softmax discretization layer
-2. It generates synthetic training data from StyleGAN3
-3. During training, it gradually decreases the temperature parameter (annealing)
-4. The model learns to discretize the latent space while maintaining gradient flow
-5. Training tracks codebook utilization via perplexity metrics
-6. The final model is saved to `./output_gumbel/gumbel_hvae_final.pt`
+1. **Stage 1**: Basic HVAE encoder is trained to map images to StyleGAN3's W+ space
+2. **Stage 2**: Gumbel-Softmax layer is inserted between encoder and StyleGAN3
+3. The pre-trained encoder weights are loaded as a starting point
+4. During training, temperature parameter is gradually decreased (annealing)
+5. Model learns optimal discretization while maintaining gradient flow
+6. Training tracks codebook utilization via perplexity metrics
+7. Final model with discretization is saved to `./output_gumbel/gumbel_hvae_final.pt`
 
 Key advantages:
+- Two-stage training leads to more stable convergence
 - End-to-end differentiable training through discrete bottlenecks
 - Better codebook utilization via perplexity loss
 - Improved reconstruction quality at the same bit rate
